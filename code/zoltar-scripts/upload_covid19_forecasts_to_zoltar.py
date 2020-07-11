@@ -1,12 +1,14 @@
-from zoltpy.quantile_io import json_io_dict_from_quantile_csv_file
-from zoltpy import util
-from zoltpy.connection import ZoltarConnection
-from zoltpy.covid19 import VALID_TARGET_NAMES, covid19_row_validator, validate_quantile_csv_file
-import os
-import sys
-import yaml
 import hashlib
+import os
 import pickle
+import sys
+
+import yaml
+from zoltpy import util
+from zoltpy.covid19 import COVID_TARGETS, COVID_ADDL_REQ_COLS, covid19_row_validator, \
+    validate_quantile_csv_file
+from zoltpy.quantile_io import json_io_dict_from_quantile_csv_file
+from datetime import datetime
 
 # meta info
 project_name = 'COVID-19 Forecasts'
@@ -43,24 +45,33 @@ def upload_covid_all_forecasts(path_to_processed_model_forecasts, dir_name):
 
     # Get all forecasts in the directory of this model
     forecasts = os.listdir(path_to_processed_model_forecasts)
-
+    conn.re_authenticate_if_necessary()
     # Get model name or create a new model if it's not in the current Zoltar project
-    metadata = metadata_dict_for_file(path_to_processed_model_forecasts+'metadata-'+dir_name+'.txt')
+    try:
+        metadata = metadata_dict_for_file(
+            path_to_processed_model_forecasts + 'metadata-' + dir_name + '.txt')
+    except Exception as ex:
+        return ex
     model_name = metadata['model_name']
     if model_name not in model_names:
         model_config = {}
-        model_config['name'], model_config['abbreviation'], model_config['team_name'], model_config['description'], model_config['home_url'], model_config['aux_data_url'] \
-            = metadata['model_name'], metadata['model_abbr'], metadata['team_name'], metadata['methods'], url + dir_name, 'NA'
+        model_config['name'], model_config['abbreviation'], model_config['team_name'], \
+        model_config['description'], model_config['home_url'], model_config['aux_data_url'] \
+            = metadata['model_name'], metadata['team_abbr'] + '-' + metadata['model_abbr'], \
+              metadata['team_name'], metadata['methods'], metadata['website_url'] if metadata.get(
+            'website_url') != None else url + dir_name, 'NA'
         try:
+            print('Create model %s' % model_name)
             project_obj.create_model(model_config)
             models = project_obj.models
             model_names = [model.name for model in models]
         except Exception as ex:
-            return ex  
+            return ex
+    print('Time: %s \t Model: %s' % (datetime.now(), model_name))
     model = [model for model in models if model.name == model_name][0]
 
     # Get names of existing forecasts to avoid re-upload
-    existing_forecasts = [forecast.source for forecast in model.forecasts]
+    existing_time_zeros = [forecast.timezero.timezero_date for forecast in model.forecasts]
 
     # Batch upload
     json_io_dict_batch = []
@@ -68,30 +79,32 @@ def upload_covid_all_forecasts(path_to_processed_model_forecasts, dir_name):
     timezero_date_batch = []
 
     for forecast in forecasts:
-        over_write = False
-        with open(path_to_processed_model_forecasts+forecast, "rb") as f:
-            # Check if forecast is already on zoltar
-            if forecast in existing_forecasts:
-                # Get the current hash of a processed file
-                checksum = hashlib.md5(f.read()).hexdigest()
-                f.close()
 
-                # Check this hash against the previous version of hash
-                if db.get(forecast, None) != checksum:
-                    print(forecast)
-                    db[forecast] = checksum
+        # Default config
+        over_write = False
+        checksum = 0
+        time_zero_date = forecast.split(dir_name)[0][:-1]
+
+        # Check if forecast is already on zoltar
+        with open(path_to_processed_model_forecasts + forecast, "rb") as f:
+            # Get the current hash of a processed file
+            checksum = hashlib.md5(f.read()).hexdigest()
+            f.close()
+
+            # Check this hash against the previous version of hash
+            if db.get(forecast, None) != checksum:
+                print(forecast)
+                if time_zero_date in existing_time_zeros:
                     over_write = True
-                else:
-                    continue
+            else:
+                continue
 
         # Skip metadata text file
         if '.txt' in forecast:
             continue
 
-        with open(path_to_processed_model_forecasts+forecast) as fp:
-
-            # Get timezero and create timezero on zoltar if not existed
-            time_zero_date = forecast.split(dir_name)[0][:-1]
+        with open(path_to_processed_model_forecasts + forecast) as fp:
+            # Create timezero on zoltar if not existed
             if time_zero_date not in project_timezeros:
                 try:
                     project_obj.create_timezero(time_zero_date)
@@ -100,17 +113,24 @@ def upload_covid_all_forecasts(path_to_processed_model_forecasts, dir_name):
                     return ex
 
             # Validate covid19 file
-            errors_from_validation = validate_quantile_csv_file(path_to_processed_model_forecasts+forecast)
+            errors_from_validation = validate_quantile_csv_file(
+                path_to_processed_model_forecasts + forecast)
 
             # Upload forecast
             if "no errors" == errors_from_validation:
-                quantile_json, error_from_transformation = json_io_dict_from_quantile_csv_file(fp, VALID_TARGET_NAMES, covid19_row_validator)
-                if len(error_from_transformation) >0 :
+                quantile_json, error_from_transformation = json_io_dict_from_quantile_csv_file(fp,
+                                                                                               COVID_TARGETS,
+                                                                                               covid19_row_validator,
+                                                                                               COVID_ADDL_REQ_COLS)
+                if len(error_from_transformation) > 0:
                     return error_from_transformation
                 else:
                     try:
+                        print('Upload forecast for model: %s \t|\t File: %s' % (model_name,forecast))
+                        print()
                         util.upload_forecast(conn, quantile_json, forecast, 
                                                 project_name, model_name , time_zero_date, overwrite=over_write)
+                        db[forecast] = checksum
                     except Exception as ex:
                         print(ex)
                         return ex
@@ -120,7 +140,7 @@ def upload_covid_all_forecasts(path_to_processed_model_forecasts, dir_name):
             else:
                 return errors_from_validation
             fp.close()
-    
+
     # # Batch upload for better performance
     # if len(json_io_dict_batch) > 0:
     #     try:
@@ -130,30 +150,26 @@ def upload_covid_all_forecasts(path_to_processed_model_forecasts, dir_name):
     return "Pass"
 
 
-# Example Run: python3 ./code/zoltar-scripts/upload_covid19_forecasts_to+zoltar.py
+# Example Run: python3 ./code/zoltar-scripts/upload_covid19_forecasts_to_zoltar.py
 if __name__ == '__main__':
     list_of_model_directories = os.listdir('./data-processed/')
     output_errors = {}
     for directory in list_of_model_directories:
-        # if directory!= "CU-60contact":
-        #     continue
         if "." in directory:
             continue
-        output = upload_covid_all_forecasts('./data-processed/'+directory+'/',directory)
+        output = upload_covid_all_forecasts('./data-processed/' + directory + '/', directory)
         if output != "Pass":
             output_errors[directory] = output
-    
-    # List all files that did not get upload and its error
-    if len(output_errors) > 0:
-        for directory, errors in output_errors.items():
-            print("\n* ERROR IN '", directory, "'")
-            for error in errors:
-                print(error)
-        sys.exit("\n ERRORS FOUND EXITING BUILD...")
-    else:
-        print("✓ no errors")
 
     with open('./code/zoltar-scripts/validated_file_db.p', 'wb') as fw:
         pickle.dump(db, fw)
         fw.close()
-    
+
+    # List all files that did not get upload and its error
+    if len(output_errors) > 0:
+        for directory, errors in output_errors.items():
+            print("\n* ERROR IN '", directory, "'")
+            print(errors)
+        sys.exit("\n ERRORS FOUND EXITING BUILD...")
+    else:
+        print("✓ no errors")
